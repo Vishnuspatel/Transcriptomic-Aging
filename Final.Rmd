@@ -1,0 +1,538 @@
+---
+title: "Final"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Import Packages
+library(dplyr)
+library(tidyr)
+library(tidyverse) 
+```
+
+```{r}
+library(tidyverse)
+
+# 1. Load Data
+fpkm <- read.csv("fpkm.csv", check.names = FALSE)
+meta <- read.csv("MetaDataSheet.csv", check.names = FALSE)
+
+# 2. Separate Expression and Transpose
+# The notebook uses: df = dfo.iloc[:,8:].T
+# This skips the first 8 metadata columns and makes samples the rows
+expression_raw <- t(fpkm[, 9:ncol(fpkm)])
+colnames(expression_raw) <- fpkm[, 1] # Set Transcript IDs as column names
+
+# 3. Research-Specific Gene Filtering (_subset_genes logic)
+# Note: The notebook code cells use thresholds of 5.0, not 1.0 or 2.0.
+subset_min <- 5.0
+subset_fold <- 5.0
+eps <- 0.001 # Used in the notebook to prevent division by zero
+
+# Selection criteria are calculated on non-log FPKM
+max_vals <- apply(expression_raw, 2, max)
+min_vals <- apply(expression_raw, 2, min)
+# "mvt[ mvt<eps ] = eps" from the notebook:
+min_vals[min_vals < eps] <- eps
+fold_change <- max_vals / min_vals
+
+# Identify genes that meet BOTH criteria
+keep_genes <- which(max_vals > subset_min & fold_change > subset_fold)
+expression_filtered <- expression_raw[, keep_genes]
+
+# 4. Log Transformation
+# The notebook uses: np.log2(data + 1)
+X_log <- log2(expression_filtered + 1)
+
+# 5. Metadata Integration (Research-Grade Labels)
+# The notebook parses the 'Tracking ID' from the sample name and looks it up in meta
+labels <- data.frame(Sample_FullName = rownames(X_log)) %>%
+  mutate(Tracking_ID = str_extract(Sample_FullName, "^[^_]+")) %>%
+  left_join(meta %>% mutate(`Tracking ID` = as.character(`Tracking ID`)), 
+            by = c("Tracking_ID" = "Tracking ID")) %>%
+  mutate(
+    # Replicate notebook's age parsing (fw/nb/da/yr)
+    Age_Numeric = case_when(
+      str_detect(tolower(Age), "fw") ~ as.numeric(str_extract(Age, "\\d+")),
+      str_detect(tolower(Age), "(nb|da)") ~ 0,
+      str_detect(tolower(Age), "yr") ~ as.numeric(str_extract(Age, "\\d+")),
+      TRUE ~ NA_real_
+    ),
+    Condition = tolower(Condition),
+    Gender = tolower(Gender)
+  )
+
+# 6. Final Cleaned Dataset
+# Combine the labels and the filtered, log-transformed expression data
+fpkm_cleaned <- cbind(labels[, c("Tracking_ID", "Age_Numeric", "Gender", "Condition")], X_log)
+```
+
+```{r}
+pca_out <- prcomp(fpkm_cleaned[, 5:ncol(fpkm_cleaned)], center = TRUE, scale. = TRUE)
+
+pca_features <- data.frame(pca_out$x[, 1:2]) %>%
+  bind_cols(fpkm_cleaned[, 1:4])
+
+train_data <- pca_features %>% filter(Condition == "normal")
+hgps_data  <- pca_features %>% filter(Condition == "hgps")
+```
+
+
+
+```{r}
+library(caret)
+library(neuralnet)
+
+# 1. Scaling the PC data
+# Neural networks work best when inputs are between 0 and 1 or -1 and 1.
+# We'll use caret's preProcess to scale our training and progeria data.
+preProcValues <- preProcess(train_data[, c("PC1", "PC2")], method = c("center", "scale"))
+
+train_scaled <- predict(preProcValues, train_data)
+hgps_scaled  <- predict(preProcValues, hgps_data)
+
+# 2. Set up Cross-Validation control
+ctrl <- trainControl(method = "cv", number = 10)
+
+# 3. Train the Neural Network with a higher 'threshold' and 'stepmax'
+# threshold: higher value (0.1) makes it easier to converge
+# stepmax: allows the model more "tries" to find the answer
+set.seed(42)
+nn_clock <- train(Age_Numeric ~ PC1 + PC2, 
+                  data = train_scaled, 
+                  method = "neuralnet", 
+                  trControl = ctrl,
+                  tuneGrid = expand.grid(layer1 = 5, 
+                                         layer2 = 0, 
+                                         layer3 = 0),
+                  linear.output = TRUE,
+                  threshold = 0.1,  
+                  stepmax = 1e6)
+
+# Check the results again
+print(nn_clock)
+```
+
+```{r}
+# 1. Get the predictions from your NN model
+predictions <- predict(nn_clock, train_scaled)
+
+# 2. Calculate the Absolute Errors (the "distance" for each person)
+abs_errors <- abs(train_scaled$Age_Numeric - predictions)
+
+# 3. Calculate Mean (MAE) and Median (MedAE)
+mae_val <- mean(abs_errors)
+med_ae_val <- median(abs_errors)
+
+# 4. Print the results clearly
+cat("--- Performance Metrics ---\n")
+cat("Mean Absolute Error (MAE):   ", round(mae_val, 2), " years\n")
+cat("Median Absolute Error (MedAE):", round(med_ae_val, 2), " years\n")
+```
+
+
+
+
+
+
+```{r}
+# 1. Get predictions from the NN model
+nn_preds <- predict(nn_clock, train_scaled)
+
+# 2. Create a results dataframe
+nn_results <- data.frame(Actual = train_scaled$Age_Numeric, 
+                         Predicted = nn_preds)
+
+# 3. Plot
+ggplot(nn_results, aes(x = Actual, y = Predicted)) +
+  geom_point(color = "darkgreen", alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  labs(title = "Neural Network: Predicted vs. Actual Age",
+       subtitle = paste("MAE:", round(mean(abs(nn_results$Actual - nn_results$Predicted)), 2)),
+       x = "Chronological Age (Years)",
+       y = "Predicted Biological Age (Years)") +
+  theme_minimal()
+```
+
+```{r}
+# Plotting the difference (Error) against Actual Age
+ggplot(nn_results, aes(x = Actual, y = Predicted - Actual)) +
+  geom_point() +
+  geom_hline(yintercept = 0, color ="cornflowerblue") +
+  labs(
+       x = "Chronological Age", y = "Error") +
+  theme_minimal()
+```
+
+
+
+```{r}
+# 1. Get the absolute loadings for PC1
+pc1_loadings <- abs(pca_results$rotation[, "PC2"])
+
+# 2. Sort and take the top 100 genes
+top_100_genes <- sort(pc1_loadings, decreasing = TRUE)[1:100]
+
+# 3. Clean the names (removing version numbers if present, e.g., NM_001.1 -> NM_001)
+clean_gene_names <- gsub("\\..*$", "", names(top_100_genes))
+
+# 4. Print the list to copy/paste
+cat(clean_gene_names, sep = "\n")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Extract PC1 loadings (rotation)
+pc1_data <- data.frame(GeneID = rownames(pca_results$rotation), 
+                       Loading = pca_results$rotation[, "PC1"])
+
+# 2. Add an "Direction" column and filter for the Top 20
+top_loadings <- pc1_data %>%
+  mutate(AbsLoading = abs(Loading),
+         Direction = ifelse(Loading > 0, "Increasing", "Decreasing")) %>%
+  arrange(desc(AbsLoading)) %>%
+  slice(1:20) # Take the top 20
+
+# 3. Create the Dot Plot
+ggplot(top_loadings, aes(x = AbsLoading, y = reorder(GeneID, AbsLoading))) +
+  # Draw a horizontal line behind the point for style
+  # Add the points, colored by direction
+  geom_point(size = 2) +
+    # Add titles and labels
+  labs(
+       x = "Absolute Gene Weight",
+       y = "Gene Identifier") +
+  theme_minimal()
+# Save the plot
+ggsave("Top_Aging_Drivers_PC1.png", width = 8, height = 7, dpi = 300)
+```
+
+
+
+
+
+```{r}
+# 1. Calculate the percentage of variance explained
+pca_var <- pca_out$sdev^2
+pca_var_perc <- (pca_var / sum(pca_var)) * 100
+
+# 2. Create a data frame for the first 10 components
+scree_df <- data.frame(
+  PC = 1:10, 
+  Variance = pca_var_perc[1:10]
+)
+
+# 3. Generate the Scree Line Plot
+ggplot(scree_df, aes(x = PC, y = Variance)) +
+  geom_line(color = "cornflowerblue") +      # The main line
+  geom_point(color = "black") +            # Individual points for each PC
+  scale_x_continuous(breaks = 1:10) +              # Ensure every PC number is shown
+  labs(
+       x = "Principal Component", 
+       y = "Variance Explained") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r}
+library(kableExtra)
+
+# We take the first 10 rows and the first 10 columns (Metadata + first few genes)
+# to keep the table readable.
+fpkm_cleaned %>%
+  head(10) %>%
+  select(1:6) %>% 
+  kbl(booktabs = TRUE,
+      align = "lcccccccc") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+
+```{r}
+# 1. Run PCA
+pca_out <- prcomp(X_log, center = TRUE, scale. = TRUE)
+
+# 2. Extract Variance for Axis Labels
+pca_var_perc <- round(pca_out$sdev^2 / sum(pca_out$sdev^2) * 100, 1)
+
+# 3. Create the Plotting Dataframe
+pca_plot_df <- data.frame(pca_out$x) %>%
+  bind_cols(labels)
+
+# 4. Generate the Biplot (Cambria removed to avoid warnings)
+ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = Age_Numeric, shape = Condition)) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey80") +
+  geom_vline(xintercept = 0, linetype = "solid", color = "grey80") +
+  
+  geom_point(size = 4, alpha = 0.8) +
+  
+  scale_color_viridis_c(option = "magma", name = "Age") +
+  
+  labs(
+       x = paste0("PC1"),
+       y = paste0("PC2")) +
+  
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right",
+        # Switching to "sans" (standard Arial/Helvetica style)
+        text = element_text(family = "sans"))
+```
+
+```{r}
+# Expanded Grid for Optimization
+xgb_grid_v2 <- expand.grid(
+  nrounds = c(100, 200, 300), # Give it more trees to learn
+  max_depth = c(3, 4, 5),     # Allow more complex interactions
+  eta = c(0.05, 0.1, 0.2),    # Test faster and medium learning rates
+  gamma = c(0, 1),            # Add a bit of regularization
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+set.seed(42)
+xgb_clock_v2 <- train(
+  Age_Numeric ~ PC1 + PC2,
+  data = train_scaled,
+  method = "xgbTree",
+  trControl = loocv_ctrl,
+  tuneGrid = xgb_grid_v2,
+  verbosity = 0
+)
+
+print(xgb_clock_v2)
+```
+
+
+```{r}
+print(xgb_clock_v2$bestTune)
+```
+
+
+```{r}
+# 1. Pull the best results using base R indexing instead of slice()
+# We look for the row where MAE is the lowest
+best_results <- xgb_clock_v2$results[which.min(xgb_clock_v2$results$MAE), ]
+
+# 2. Get predictions to calculate MedAE
+# Note: Ensure you use 'train_scaled' or whichever dataset you used to train
+predictions <- predict(xgb_clock_v2, train_scaled)
+abs_errors <- abs(train_scaled$Age_Numeric - predictions)
+
+# 3. Final Summary
+cat("--- Optimized XGBoost Performance ---\n")
+cat("Best MAE:   ", round(best_results$MAE, 2), "years\n")
+cat("Best R2:    ", round(best_results$Rsquared, 3), "\n")
+cat("Best MedAE: ", round(median(abs_errors), 2), "years\n")
+
+# 4. Show the winning parameters
+cat("\nOptimal Settings: nrounds =", best_results$nrounds, 
+    ", max_depth =", best_results$max_depth, 
+    ", eta =", best_results$eta)
+```
+
+```{r}
+library(ggplot2)
+library(patchwork)
+
+# 1. Ultra-clean theme function
+minimal_age_theme <- function() {
+  list(
+    # Points are now black, line is blue
+    geom_point(color = "black", alpha = 0.4, size = 1.5), 
+    geom_smooth(method = "lm", formula = y ~ x, color = "cornflowerblue", fill = "lightblue", se = TRUE, linewidth = 1),
+    geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray60"),
+    scale_x_continuous(limits = c(0, 100)),
+    scale_y_continuous(limits = c(0, 100)),
+    theme_classic(),
+    theme(
+      # Normal (unbold) titles
+      plot.title = element_text(hjust = 0.5, face = "plain", size = 12),
+      axis.line = element_line(color = "black"),
+      panel.grid = element_blank(),
+      axis.title = element_text(size = 10)
+    )
+  )
+}
+
+# 2. Build the Neural Network Plot
+p_nn <- ggplot(data.frame(x = train_scaled$Age_Numeric, y = as.numeric(nn_preds)), aes(x, y)) +
+  minimal_age_theme() +
+  labs(title = "Neural Network", y = "Predicted age", x = "True age")
+
+# 3. Build the XGBoost Plot
+p_xgb <- ggplot(data.frame(x = train_scaled$Age_Numeric, y = as.numeric(xgb_preds)), aes(x, y)) +
+  minimal_age_theme() +
+  labs(title = "XGBoost", y = "", x = "True age") +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+# 4. Combine side-by-side
+p_nn | p_xgb
+```
+
+
+```{r}
+# 1. Prepare the High-Dimensional Data
+# Get the names of the top 100 genes from your previous PCA analysis
+top_gene_names <- names(sort(abs(pca_results$rotation[, "PC1"]), decreasing = TRUE)[1:100])
+
+# 2. Filter and Clean
+nn_data_full <- fpkm_cleaned %>%
+  filter(Condition == "healthy") %>%
+  # Keep only Age and our Top 100 biological drivers
+  select(Age_Numeric, all_of(top_gene_names)) %>%
+  # Final safety check for NAs
+  drop_na()
+
+# 3. Scaling is MANDATORY for Neural Nets
+# We scale all 100 genes so they are on the same "playing field"
+preProcFull <- preProcess(nn_data_full %>% select(-Age_Numeric), method = c("center", "scale"))
+nn_data_scaled <- predict(preProcFull, nn_data_full)
+
+# 4. Train the "Biological" Neural Network
+# We use a single layer of 5-10 nodes to prevent overfitting
+set.seed(42)
+nn_full_clock <- train(Age_Numeric ~ ., 
+                       data = nn_data_scaled, 
+                       method = "neuralnet", 
+                       trControl = trainControl(method = "cv", number = 10),
+                       tuneGrid = expand.grid(layer1 = 8, layer2 = 0, layer3 = 0),
+                       linear.output = TRUE,
+                       threshold = 0.5, # Higher threshold helps with high-dimensional convergence
+                       stepmax = 1e6)
+
+print(nn_full_clock)
+```
+
+
+
+```{r}
+library(xgboost)
+library(caret)
+
+# 1. Filter for Healthy Donors (as we did for the PCA and NN models)
+# This ensures we are measuring "Normal Aging" first
+xgb_data_full <- fpkm_cleaned %>%
+  filter(Condition == "healthy") %>%
+  filter(!is.na(Age_Numeric)) %>%
+  select(-Tracking_ID, -Gender, -Condition) # Remove metadata, keep Age + Genes
+
+# 2. Set up LOOCV
+loocv_ctrl <- trainControl(method = "LOOCV")
+
+# 3. Define a grid that prevents overfitting on high dimensions
+# With 4,000 genes, we use 'colsample_bytree' to force the model
+# to look at different subsets of genes for each tree.
+xgb_full_grid <- expand.grid(
+  nrounds = 150,           # More trees to handle the complexity
+  max_depth = 3,           # Shallow trees to prevent memorization
+  eta = 0.05,              # Slow learning rate for stability
+  gamma = 1,               # Penalty for unnecessary complexity
+  colsample_bytree = 0.3,  # Each tree only looks at 30% of the genes
+  min_child_weight = 1,
+  subsample = 0.8          # Each tree looks at 80% of samples
+)
+
+# 4. Train the Model (This will take longer than the PCA version)
+set.seed(42)
+xgb_full_model <- train(
+  Age_Numeric ~ .,
+  data = xgb_data_full,
+  method = "xgbTree",
+  trControl = loocv_ctrl,
+  tuneGrid = xgb_full_grid,
+  verbosity = 0
+)
+
+# 5. Review the results
+print(xgb_full_model)
+
+# 6. Extract the "Biological Heroes" (Top Features)
+importance <- varImp(xgb_full_model, scale = FALSE)
+plot(importance, top = 20, main = "Top Genetic Predictors (Full Transcriptome)")
+```
+
+```{r}
+library(tidyverse)
+
+# 1. Create a clean training set
+# We filter for healthy donors and drop the non-numeric metadata
+xgb_ready_data <- fpkm_cleaned %>%
+  filter(Condition == "healthy") %>%
+  select(-Tracking_ID, -Gender, -Condition) %>%
+  # THE FIX: Drop any column (gene) that has an NA value
+  select_if(~ !any(is.na(.))) 
+
+# 2. Safety Verification
+# This should print 0. If it doesn't, check your Age_Numeric column for NAs.
+print(paste("Missing values remaining:", sum(is.na(xgb_ready_data))))
+
+# 3. Check the "Survivors"
+# This tells you how many genes are left to train on
+print(dim(xgb_ready_data))
+```
+
+```{r}
+library(tidyverse)
+
+# 1. The Clean Sweep
+# We start with your full dataset and aggressively prune NAs
+nn_final_data <- fpkm_cleaned %>%
+  # Keep only healthy samples
+  filter(Condition == "healthy") %>%
+  # Ensure Age_Numeric itself isn't missing
+  filter(!is.na(Age_Numeric)) %>%
+  # Remove the metadata strings
+  select(-Tracking_ID, -Gender, -Condition) %>%
+  # DROP GENES: If a gene has even ONE missing value, delete the whole gene column
+  select(where(~ !any(is.na(.))))
+
+# 2. THE DIAGNOSTIC (Check your console after running)
+cat("--- DATA CLEANING REPORT ---\n")
+cat("Final Samples (Rows): ", nrow(nn_final_data), "\n")
+cat("Final Genes (Columns): ", ncol(nn_final_data), "\n")
+cat("Total NA values remaining: ", sum(is.na(nn_final_data)), "\n")
+
+# 3. IF THE COUNT ABOVE IS 0, PROCEED TO MODEL:
+if(sum(is.na(nn_final_data)) == 0) {
+  
+  # Select the Top 100 Genes for the NN (using your previous PCA results)
+  top_gene_names <- names(sort(abs(pca_results$rotation[, "PC1"]), decreasing = TRUE)[1:100])
+  
+  # Ensure these top genes actually exist in our cleaned data
+  available_genes <- intersect(top_gene_names, colnames(nn_final_data))
+  
+  nn_ready <- nn_final_data %>% 
+    select(Age_Numeric, all_of(available_genes))
+  
+  # Scale and Train
+  preProcFull <- preProcess(nn_ready %>% select(-Age_Numeric), method = c("center", "scale"))
+  nn_scaled <- predict(preProcFull, nn_ready)
+  
+  set.seed(42)
+  nn_full_clock <- train(
+    Age_Numeric ~ ., 
+    data = nn_scaled, 
+    method = "neuralnet", 
+    trControl = trainControl(method = "cv", number = 10),
+    tuneGrid = expand.grid(layer1 = 5, layer2 = 0, layer3 = 0),
+    linear.output = TRUE,
+    threshold = 0.5,
+    stepmax = 1e6
+  )
+  
+  print(nn_full_clock)
+  
+} else {
+  stop("Data still contains NAs! Check your Age_Numeric column specifically.")
+}
+```
+
